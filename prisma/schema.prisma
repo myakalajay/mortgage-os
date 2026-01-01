@@ -1,0 +1,203 @@
+// -----------------------------------------------------------------------------
+// PRISMA SCHEMA: Regulated Mortgage Platform
+// -----------------------------------------------------------------------------
+// INTENT: Defines the strict contract between the application and the database.
+// This schema prioritizes data integrity, auditability, and relationship constraints
+// necessary for a US-based financial lending system.
+// -----------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS: Strict Domain Definitions
+// -----------------------------------------------------------------------------
+
+enum UserRole {
+  SUPER_ADMIN
+  LENDER
+  BORROWER
+}
+
+enum AccountStatus {
+  ACTIVE                // Full access granted
+  INACTIVE              // Soft deleted or voluntary closure
+  LOCKED                // Security freeze (too many attempts)
+  SUSPENDED             // Compliance violation
+  PENDING_VERIFICATION  // Email/KYC pending
+}
+
+enum LoanStatus {
+  DRAFT                 // Borrower is still typing
+  SUBMITTED             // Sent to Lender
+  PROCESSING            // Lender is reviewing
+  UNDERWRITING          // Risk assessment
+  APPROVED_CONDITIONAL  // Approved but needs more docs
+  CLEAR_TO_CLOSE        // Final approval
+  CLOSED                // Done
+  REJECTED              // Denied
+  WITHDRAWN             // Borrower cancelled
+}
+
+enum LoanType {
+  PURCHASE
+  REFINANCE
+}
+
+enum AuditAction {
+  USER_LOGIN
+  USER_REGISTER
+  PASSWORD_RESET
+  STATUS_CHANGE
+  DOCUMENT_UPLOAD
+  LOAN_APPLICATION_SUBMIT
+  SYSTEM_CONFIG_CHANGE
+  PROFILE_UPDATE
+}
+
+// -----------------------------------------------------------------------------
+// MODELS: Core Identity & Access
+// -----------------------------------------------------------------------------
+
+model User {
+  id            String        @id @default(uuid())
+  email         String        @unique
+  passwordHash  String        // Bcrypt hash (never store plain text)
+  firstName     String
+  lastName      String
+  role          UserRole
+  status        AccountStatus @default(PENDING_VERIFICATION)
+  
+  // Security & Compliance
+  lastLoginAt   DateTime?
+  failedAttempts Int          @default(0) // For account locking logic
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  
+  // Relations
+  auditLogs        AuditLog[]        // History of actions performed BY this user
+  loanApplications LoanApplication[] // <--- ADDED: Reverse relation for Loans
+  documents        Document[]        // <--- ADDED: Reverse relation for Docs
+
+  notesAuthored LoanNote[]
+
+  // Performance Indexes
+  @@index([email])
+  @@index([role])
+  @@map("users") // Maps to lowercase 'users' table in Postgres
+}
+
+// -----------------------------------------------------------------------------
+// MODEL: Immutable Audit Trail
+// -----------------------------------------------------------------------------
+
+model AuditLog {
+  id        String      @id @default(uuid())
+  userId    String?     // Nullable to preserve log if User is hard-deleted
+  action    AuditAction
+  metadata  Json?       // Flexible JSON for context (IP, UserAgent, Diff)
+  createdAt DateTime    @default(now())
+
+  // Relations
+  user      User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+// -----------------------------------------------------------------------------
+// MODEL: System Configuration
+// -----------------------------------------------------------------------------
+
+model SystemConfig {
+  key         String   @id // e.g., "BASE_INTEREST_RATE"
+  value       String   // e.g., "5.5"
+  description String?
+  updatedAt   DateTime @updatedAt
+  updatedBy   String?  // ID of the admin who changed it
+}
+
+// -----------------------------------------------------------------------------
+// MODEL: Products & Pricing
+// -----------------------------------------------------------------------------
+
+model LoanProduct {
+  id          String   @id @default(uuid())
+  name        String   // "30-Year Fixed"
+  baseRate    Decimal  // 6.5
+  minScore    Int      // 620
+  isActive    Boolean  @default(true)
+}
+
+// -----------------------------------------------------------------------------
+// MODEL: Loan Application (The 1003 Form)
+// -----------------------------------------------------------------------------
+
+model LoanApplication {
+  id              String      @id @default(uuid())
+  userId          String      // The Borrower
+  status          LoanStatus  @default(DRAFT)
+  
+  // High-Level Data
+  loanType        LoanType    @default(PURCHASE)
+  loanAmount      Decimal?    @db.Decimal(12, 2)
+  propertyAddress String?
+  propertyCity    String?
+  propertyState   String?
+  propertyZip     String?
+  estimatedValue  Decimal?    @db.Decimal(12, 2)
+  
+  // 1003 Form Data (JSON is best for complex forms that change often)
+  formData        Json?       // Stores employment, assets, liabilities
+  
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  // Relations
+  user            User        @relation(fields: [userId], references: [id])
+  documents       Document[]
+  notes           LoanNote[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+// -----------------------------------------------------------------------------
+// MODEL: Documents
+// -----------------------------------------------------------------------------
+
+model Document {
+  id              String    @id @default(uuid())
+  loanId          String?
+  userId          String
+  name            String    // "W2_2023.pdf"
+  type            String    // "INCOME_VERIFICATION"
+  url             String    // S3 or Blob URL
+  status          String    @default("PENDING") // PENDING, APPROVED, REJECTED
+  
+  createdAt       DateTime  @default(now())
+
+  loanApplication LoanApplication? @relation(fields: [loanId], references: [id])
+  user            User      @relation(fields: [userId], references: [id])
+}
+
+model LoanNote {
+  id        String   @id @default(uuid())
+  loanId    String
+  userId    String   // The Lender/Admin who wrote the note
+  content   String   @db.Text
+  createdAt DateTime @default(now())
+
+  loan      LoanApplication @relation(fields: [loanId], references: [id])
+  author    User            @relation(fields: [userId], references: [id])
+  
+  @@index([loanId])
+}
